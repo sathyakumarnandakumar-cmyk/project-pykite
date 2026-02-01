@@ -44,8 +44,12 @@ class TokenHandler(http.server.SimpleHTTPRequestHandler):
                 client = kite.generate_session(request_token, api_secret=API_SECRET)
                 access_token = client["access_token"]
                 
-                # Save tokens using centralized config
+                # Print access token preview (first 5 characters for security)
+                print(f"\n[INFO] Access Token received: {access_token[:5]}...")
+                
+                # Save tokens using centralized config (it knows where to save)
                 save_tokens(request_token, access_token)
+                print(f"[INFO] Tokens saved via config.save_tokens()")
                 
                 # Send success message to browser
                 self.send_response(200)

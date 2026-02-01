@@ -35,9 +35,17 @@ LOGIN_URL = f"https://kite.zerodha.com/connect/login?v=3&api_key={API_KEY}" if A
 
 def save_tokens(request_token: str, access_token: str):
     """Save request_token and access_token to secrets/.env_access"""
+    from datetime import datetime
+    
+    print(f"[INFO] Saving tokens to: {os.path.abspath(ENV_ACCESS_FILE)}")
+    
+    # Save tokens with timestamp
+    saved_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     set_key(ENV_ACCESS_FILE, "KITE_REQUEST_TOKEN", request_token)
     set_key(ENV_ACCESS_FILE, "KITE_ACCESS_TOKEN", access_token)
-    print(f"✓ Tokens saved to {ENV_ACCESS_FILE}")
+    set_key(ENV_ACCESS_FILE, "KITE_TOKEN_SAVED_TIME", saved_time)
+    
+    print(f"✓ Tokens saved successfully at: {saved_time}")
 
 
 def load_access_token() -> str:
