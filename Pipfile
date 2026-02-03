@@ -1,0 +1,36 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+ansible = "==11.2.0"
+ansible-core = "==2.18.2"
+cffi = "==1.17.1"
+cryptography = "==43.0.3"
+distlib = "==0.3.9"
+filelock = "==3.17.0"
+jinja2 = "==3.1.4"
+markupsafe = "==3.0.2"
+packaging = "==24.2"
+platformdirs = "==4.3.6"
+pycparser = "==2.22"
+pyyaml = "==6.0.2"
+resolvelib = "==1.0.1"
+virtualenv = "==20.29.1"
+kiteconnect = "*"
+requests = "*"
+fastapi = "*"
+uvicorn = "*"
+streamlit = "*"
+python-dotenv = "*"
+flask = "*"
+py-vollib = "*"
+
+[dev-packages]
+ipykernel = "*"
+py-vollib = "*"
+matplotlib = "*"
+
+[requires]
+python_version = "3.13"
