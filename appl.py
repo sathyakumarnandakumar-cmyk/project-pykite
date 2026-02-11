@@ -9,7 +9,7 @@ import os
 import tempfile
 import warnings
 import dash
-from dash import Dash, html, dcc, Input, Output, State
+from dash import Dash, html, dcc, Input, Output, State, dash_table
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import time
@@ -271,7 +271,7 @@ def calculate_iv_vollib(option_chain, metadata=None, risk_free_rate=0.10, oi_fil
     expiry_dt = expiry + pd.Timedelta(hours=15, minutes=30)
     now = pd.Timestamp.now()
     t = (expiry_dt - now).total_seconds() / (365.25 * 24 * 3600)
-    if t <= 0: t = 0.0001
+    if t <= 0: t = 1 / 365.25  # Min 1 day to avoid IV explosion on expiry day
     
     ivs = []
     with warnings.catch_warnings():
@@ -280,18 +280,54 @@ def calculate_iv_vollib(option_chain, metadata=None, risk_free_rate=0.10, oi_fil
             try:
                 price = float(row['mid_price'])
                 strike = float(row['strike'])
+                bid = float(row.get('bid', 0))
+                ask = float(row.get('ask', 0))
+                oi = float(row.get('oi', 0))
                 flag = 'c' if row['instrument_type'] == 'CE' else 'p'
                 
+                # Guard 1: Skip if strike is invalid
+                if strike <= 0:
+                    ivs.append(0)
+                    continue
+                
+                # Guard 2: Skip if no real market (bid or ask is 0)
+                if bid <= 0 or ask <= 0:
+                    ivs.append(0)
+                    continue
+                
+                # Guard 3: Skip if price is too low to extract meaningful IV
                 if price < 0.05:
                     ivs.append(0)
                     continue
-                    
+                
+                # Guard 4: Intrinsic value floor — skip if no extrinsic value
+                if flag == 'c':
+                    intrinsic = max(0, spot_price - strike)
+                else:
+                    intrinsic = max(0, strike - spot_price)
+                
+                if price <= intrinsic + 0.01:
+                    # Mid-price is at or below intrinsic — no time value to extract IV from
+                    ivs.append(0)
+                    continue
+                
+                # Calculate IV
                 iv = bsm_iv(price, spot_price, strike, t, risk_free_rate, flag)
-                ivs.append(iv * 100)
-            except:
+                iv_pct = iv * 100
+                
+                # Guard 5: Clamp to sane range (0-500%)
+                if iv_pct < 0 or iv_pct > 500:
+                    ivs.append(0)
+                    continue
+                
+                ivs.append(iv_pct)
+                
+            except ValueError:
+                # bsm_iv can raise ValueError for impossible prices
+                ivs.append(0)
+            except Exception as e:
                 ivs.append(0)
                 
-    option_chain['iv'] = ivs
     option_chain['iv'] = ivs
     
     # --- ATM IV CALCULATION ---
@@ -355,7 +391,13 @@ def show_chain(chain, name):
         on='strike', how='outer'
     )
     merged = merged.rename(columns={'strike': 'STRIKE'})
-    return merged.sort_values('STRIKE')
+    merged = merged.sort_values('STRIKE')
+    
+    # Replace IV=0 with NaN so Plotly draws gaps instead of dips to zero
+    merged['CE-IV'] = merged['CE-IV'].replace(0, np.nan)
+    merged['PE-IV'] = merged['PE-IV'].replace(0, np.nan)
+    
+    return merged
 
 def get_option_data(scrip_name, expiry=None):
     # The Master Function called by Dash
@@ -374,82 +416,92 @@ def get_option_data(scrip_name, expiry=None):
     
     return df_formatted, spot_price, atm_iv
 
-def generate_market_heatmap_data(limit=None):
-    # Generates data for IV Heatmap: (Symbol, Moneyness, IV/ATM_IV Ratio)
+def generate_market_heatmap_data(limit=150):
+    # Generates data for IV Heatmap + Calendar Spread
+    # Covers ALL exchanges: NFO, MCX, BFO
+    # Fetches BOTH nearest (Rank 1) and next-month (Rank 2) expiry per symbol
     heatmap_data = []
     
-    # 1. Identify NFO Symbols
-    # Use global base_name_meta_lookup
-    nfo_symbols = [k for k, v in base_name_meta_lookup.items() if v.get('exchange') == 'NFO']
+    # Collect symbols from all exchanges
+    all_symbols = []
+    for k, v in base_name_meta_lookup.items():
+        exchange = v.get('exchange', '')
+        if exchange in ('NFO', 'MCX', 'BFO'):
+            all_symbols.append((k, exchange))
     
-    # Limit for performance if needed (e.g. limit=50)
+    # Limit for performance if needed during testing
     if limit:
-        nfo_symbols = nfo_symbols[:limit]
+        all_symbols = all_symbols[:limit]
         
-    print(f"Generating Heatmap for {len(nfo_symbols)} symbols...")
+    print(f"Generating Heatmap for {len(all_symbols)} symbols (NFO + MCX + BFO), 2 expiries each...")
     
-    total = len(nfo_symbols)
-    for i, sym in enumerate(nfo_symbols):
-        # Progress Bar Logic (Simulated)
-        print(f"[{i+1}/{total}] Processing {sym}...", end='\r')
+    total = len(all_symbols)
+    for i, (sym, exchange) in enumerate(all_symbols):
+        # Progress Bar Logic
+        print(f"[{i+1}/{total}] Processing {sym} ({exchange})...", end='\r')
 
         # Add small sleep to reduce load
         time.sleep(0.01)
         
         try:
-            # We assume get_option_data is reasonably fast (1 request for quote usually, or cached)
-            # Actually get_option_data makes a Kite Quote call. 
-            # Doing this 200 times sequentially will take time (e.g. 0.2s * 200 = 40s).
-            # We might want to batch this or just let it run.
+            entry = base_name_meta_lookup.get(sym, {})
+            expiries = entry.get('options_expiries', [])
             
-            # Using nearest expiry by default
-            try:
-                meta, chain = build_option_chain(sym, enrich=True)
-            except Exception as e:
-                print(f"\n[!] Failed to build chain for {sym}: {e}")
-                continue
-                
-            if chain.empty: continue
-            
-            try:
-                chain, spot_price, atm_iv = calculate_iv_vollib(chain, metadata=meta, oi_filter_pct=0.95)
-            except ValueError as e:
-                print(f"\n[!] Value Error {sym}: {e}")
-                continue
-            except Exception as e:
-                print(f"\n[!] Calculation Error {sym}: {e}")
+            if not expiries:
                 continue
             
-            if spot_price <= 0 or atm_iv <= 0: continue
+            # Process up to 2 expiries: nearest and next-month
+            expiries_to_process = expiries[:2]  # [0]=nearest, [1]=next month (if exists)
             
-            # Calculate Ratios and Moneyness
-            # Moneyness = Strike / Spot
-            # Ratio = IV / ATM_IV
-            
-            # Filter relevant strikes (e.g. 0.8 to 1.2 moneyness) to keep heatmap focused
-            # OR just take all.
-            
-            for _, row in chain.iterrows():
-                strike = row['strike']
-                iv = row['iv']
+            for exp_rank, exp_date in enumerate(expiries_to_process, start=1):
+                try:
+                    meta, chain = build_option_chain(sym, expiry=exp_date, enrich=True)
+                except Exception as e:
+                    print(f"\n[!] Failed to build chain for {sym} exp={exp_date}: {e}")
+                    continue
+                    
+                if chain.empty: continue
                 
-                if iv <= 0: continue
+                try:
+                    chain, spot_price, atm_iv = calculate_iv_vollib(chain, metadata=meta, oi_filter_pct=0.95)
+                except ValueError as e:
+                    print(f"\n[!] Value Error {sym} exp={exp_date}: {e}")
+                    continue
+                except Exception as e:
+                    print(f"\n[!] Calculation Error {sym} exp={exp_date}: {e}")
+                    continue
                 
-                moneyness = round(strike / spot_price, 2) # Round to 2 decimals for binning
-                ratio = iv / atm_iv
+                if spot_price <= 0 or atm_iv <= 0: continue
                 
-                spread = abs(row['ask'] - row['bid']) if row['ask'] > 0 and row['bid'] > 0 else 0
-                oi = row['oi']
-                
-                heatmap_data.append({
-                    'Symbol': sym,
-                    'Moneyness': moneyness,
-                    'Ratio': ratio,
-                    'IV': iv,
-                    'Spread': spread,
-                    'OI': oi,
-                    'Type': row['instrument_type']
-                })
+                for _, row in chain.iterrows():
+                    strike = row['strike']
+                    iv = row['iv']
+                    
+                    if iv <= 0: continue
+                    
+                    moneyness = round(strike / spot_price, 2)
+                    ratio = iv / atm_iv
+                    
+                    spread = abs(row['ask'] - row['bid']) if row['ask'] > 0 and row['bid'] > 0 else 0
+                    oi = row['oi']
+                    
+                    heatmap_data.append({
+                        'Symbol': sym,
+                        'Exchange': exchange,
+                        'Expiry_Rank': exp_rank,
+                        'Expiry': str(exp_date.date()) if hasattr(exp_date, 'date') else str(exp_date),
+                        'Strike': strike,
+                        'Spot': spot_price,
+                        'Moneyness': moneyness,
+                        'Ratio': ratio,
+                        'IV': iv,
+                        'ATM_IV': atm_iv,
+                        'Bid': row['bid'],
+                        'Ask': row['ask'],
+                        'Spread': spread,
+                        'OI': oi,
+                        'Type': row['instrument_type']
+                    })
                 
         except Exception as e:
             print(f"\n[!] Error processing {sym}: {e}")
@@ -464,7 +516,7 @@ os.makedirs(_CACHE_DIR, exist_ok=True)
 _CACHE_FILE = os.path.join(_CACHE_DIR, 'heatmap_data.parquet')
 _CACHE_TTL_SECONDS = 300  # 5 minutes
 
-def _get_heatmap_data(limit=100, force_refresh=False):
+def _get_heatmap_data(limit=None, force_refresh=False):
     """Read heatmap data from disk cache if fresh, otherwise generate and save."""
     if not force_refresh and os.path.exists(_CACHE_FILE):
         file_age = time.time() - os.path.getmtime(_CACHE_FILE)
@@ -481,6 +533,61 @@ def _get_heatmap_data(limit=100, force_refresh=False):
         df.to_parquet(_CACHE_FILE, index=False)
         print(f"Cache SAVED: {len(df)} rows -> {_CACHE_FILE}")
     return df
+
+def compute_max_pain(df_heat):
+    """Compute Max Pain for each symbol from cached heatmap data.
+    Returns summary DataFrame and per-symbol pain profiles."""
+    results = []
+    pain_profiles = {}  # {symbol: DataFrame with Strike, CE_Pain, PE_Pain, Total_Pain}
+    
+    for sym, grp in df_heat.groupby('Symbol'):
+        spot = grp['Spot'].iloc[0]
+        strikes = sorted(grp['Strike'].unique())
+        
+        # Get CE and PE OI per strike
+        ce_data = grp[grp['Type'] == 'CE'][['Strike', 'OI']].groupby('Strike')['OI'].sum()
+        pe_data = grp[grp['Type'] == 'PE'][['Strike', 'OI']].groupby('Strike')['OI'].sum()
+        
+        pain_at_strike = []
+        for K in strikes:
+            # If price settles at K:
+            # CE holders gain max(0, K - strike) for strikes < K -> writers lose
+            # PE holders gain max(0, strike - K) for strikes > K -> writers lose
+            ce_pain = sum(ce_data.get(s, 0) * max(0, K - s) for s in ce_data.index)
+            pe_pain = sum(pe_data.get(s, 0) * max(0, s - K) for s in pe_data.index)
+            total = ce_pain + pe_pain
+            pain_at_strike.append({
+                'Strike': K, 'CE_Pain': ce_pain, 'PE_Pain': pe_pain,
+                'Total_Pain': total,
+                'CE_OI': ce_data.get(K, 0), 'PE_OI': pe_data.get(K, 0)
+            })
+        
+        pdf = pd.DataFrame(pain_at_strike)
+        pain_profiles[sym] = pdf
+        
+        if pdf.empty:
+            continue
+        
+        # Max Pain = strike with minimum Total Pain
+        mp_row = pdf.loc[pdf['Total_Pain'].idxmin()]
+        max_pain_strike = mp_row['Strike']
+        distance_pct = round((max_pain_strike - spot) / spot * 100, 2)
+        
+        # Top 5 highest-pain strikes
+        top5 = pdf.nlargest(5, 'Total_Pain')
+        
+        results.append({
+            'Symbol': sym,
+            'Spot': round(spot, 2),
+            'Max Pain': round(max_pain_strike, 2),
+            'Distance%': distance_pct,
+            'Bias': '🟢 Bull' if distance_pct > 0 else '🔴 Bear',
+            'Top5_Strikes': top5['Strike'].tolist(),
+            'Top5_Pain': top5['Total_Pain'].tolist()
+        })
+    
+    summary = pd.DataFrame(results).sort_values('Symbol')
+    return summary, pain_profiles
 
 
 # ==============================================================================
@@ -596,17 +703,93 @@ def layout_iv_ratio_view():
         ], style={'padding': '20px', 'backgroundColor': 'white', 'borderRadius': '10px', 'boxShadow': '0 2px 5px rgba(0,0,0,0.1)'})
     ])
 
+# Max Pain View
+def layout_max_pain_view():
+    return html.Div([
+        html.H2("Max Pain Analysis", style={'textAlign': 'center', 'color': '#333'}),
+
+        html.Button("Generate Max Pain", id="btn-maxpain", n_clicks=0,
+                     style={'display': 'block', 'margin': '20px auto', 'padding': '10px 20px',
+                            'fontSize': '16px', 'backgroundColor': '#6f42c1', 'color': 'white',
+                            'border': 'none', 'cursor': 'pointer', 'borderRadius': '5px'}),
+
+        dcc.Loading([
+            # Section 1: Summary Table
+            html.Div(id='maxpain-table-container', style={'margin': '20px 0'}),
+
+            # Section 2: Top 5 Pain Heatmap
+            dcc.Graph(id='graph-maxpain-heatmap', style={'height': '900px'}),
+
+            # Section 3: Drill-down
+            html.H3(id='drilldown-title', style={'textAlign': 'center', 'marginTop': '30px', 'color': '#555'}),
+            dcc.Graph(id='graph-maxpain-drilldown', style={'height': '500px'}),
+        ]),
+
+        # Section 4: Interpretation Notes
+        html.Div([
+            html.H4("How to Interpret Max Pain"),
+            html.Ul([
+                html.Li("Max Pain = strike where total option buyer losses are maximized (option writers profit most)."),
+                html.Li("If Spot > Max Pain → Bearish bias (market may pull back toward Max Pain)."),
+                html.Li("If Spot < Max Pain → Bullish bias (market may rally toward Max Pain)."),
+                html.Li("High pain concentration at one strike = strong magnet for expiry settlement."),
+                html.Li("Click a row in the table to see the full pain profile for that symbol."),
+            ])
+        ], style={'padding': '20px', 'backgroundColor': '#f0f0f0', 'borderRadius': '8px', 'marginTop': '30px'})
+    ])
+
+# Calendar IV Spread View
+def layout_calendar_view():
+    return html.Div([
+        html.H2("Calendar IV Spread", style={'textAlign': 'center', 'color': '#333'}),
+        html.P("Near-month IV vs Next-month IV — find calendar spread opportunities", style={'textAlign': 'center', 'color': '#666'}),
+
+        html.Button("Generate Calendar Spread", id="btn-calendar", n_clicks=0,
+                     style={'display': 'block', 'margin': '20px auto', 'padding': '10px 20px',
+                            'fontSize': '16px', 'backgroundColor': '#fd7e14', 'color': 'white',
+                            'border': 'none', 'cursor': 'pointer', 'borderRadius': '5px'}),
+
+        dcc.Loading([
+            # Section 1: ATM Calendar Spread Bar Chart
+            dcc.Graph(id='graph-calendar-atm', style={'height': '900px'}),
+
+            # Section 2: Summary DataTable
+            html.Div(id='calendar-table-container', style={'margin': '20px 0'}),
+
+            # Section 3: Strike-Level Drill-Down
+            html.H3(id='calendar-drilldown-title', style={'textAlign': 'center', 'marginTop': '30px', 'color': '#555'}),
+            dcc.Graph(id='graph-calendar-drilldown', style={'height': '550px'}),
+        ]),
+
+        # Store for calendar data
+        dcc.Store(id='store-calendar-data', storage_type='session'),
+
+        # Interpretation
+        html.Div([
+            html.H4("How to Read Calendar Spreads"),
+            html.Ul([
+                html.Li("Positive spread (Near IV > Far IV) = Contango (normal). Sell near, buy far."),
+                html.Li("Negative spread (Near IV < Far IV) = Backwardation (unusual). Buy near, sell far — or investigate."),
+                html.Li("Large |spread| = potential calendar spread trade opportunity."),
+                html.Li("Click a row in the table to see the full strike-by-strike IV comparison."),
+                html.Li("Green bars = Far IV higher at that strike (backwardation). Red = Near IV higher (contango)."),
+            ])
+        ], style={'padding': '20px', 'backgroundColor': '#f0f0f0', 'borderRadius': '8px', 'marginTop': '30px'})
+    ])
+
 layout_analyzer = html.Div(children=[
     html.H1("Option Volatility Smile Analyzer", style={'textAlign': 'center', 'color': '#333'}),
     
     html.Div([
         html.Label("Scrip Name:", style={'fontWeight': 'bold', 'marginRight': '10px'}),
-        dcc.Input(
-            id='scrip-input', 
-            type='text', 
-            value='NIFTY', 
-            placeholder='e.g. NIFTY, GOLDM',
-            style={'padding': '10px', 'fontSize': '16px', 'width': '200px'}
+        dcc.Dropdown(
+            id='scrip-input',
+            options=[{'label': k, 'value': k} for k in sorted(base_name_meta_lookup.keys())],
+            value='NIFTY',
+            placeholder='Search symbol...',
+            searchable=True,
+            clearable=False,
+            style={'width': '250px', 'fontSize': '16px'}
         ),
         html.Button(
             'Analyze', 
@@ -643,23 +826,56 @@ app.layout = html.Div([
     dcc.Store(id='store-heatmap-fig', storage_type='session'),
     dcc.Store(id='store-pcr-fig', storage_type='session'),
     dcc.Store(id='store-ivratio-fig', storage_type='session'),
-    
+    dcc.Store(id='store-maxpain-data', storage_type='session'),
+    dcc.Store(id='sidebar-state', data='open'),
+
+    # Toggle Button (always visible)
+    html.Button("☰", id="sidebar-toggle", n_clicks=0, style={
+        'position': 'fixed', 'top': '10px', 'left': '10px', 'zIndex': 1100,
+        'fontSize': '20px', 'padding': '5px 10px', 'cursor': 'pointer',
+        'backgroundColor': '#007bff', 'color': 'white', 'border': 'none',
+        'borderRadius': '5px'
+    }),
+
     # Sidebar
     html.Div([
-        html.H3("Kite Analytics", className="display-4"),
+        html.H4("Kite Analytics", style={'marginTop': '40px', 'fontSize': '16px', 'fontWeight': 'bold'}),
         html.Hr(),
-        html.Plaintext("Short Menu"),
-        
-        dcc.Link('Profile / Home', href='/', style={'display': 'block', 'padding': '10px', 'textDecoration': 'none', 'color': '#333', 'fontWeight': 'bold'}),
-        dcc.Link('Volatility Analyzer', href='/analyzer', style={'display': 'block', 'padding': '10px', 'textDecoration': 'none', 'color': '#333', 'fontWeight': 'bold'}),
-        dcc.Link('PCR Skew', href='/pcr', style={'display': 'block', 'padding': '10px', 'textDecoration': 'none', 'color': '#333', 'fontWeight': 'bold'}),
-        dcc.Link('IV Ratio', href='/iv-ratio', style={'display': 'block', 'padding': '10px', 'textDecoration': 'none', 'color': '#333', 'fontWeight': 'bold'}),
-        
-    ], style=SIDEBAR_STYLE),
+        dcc.Link('Home', href='/', style={'display': 'block', 'padding': '8px', 'textDecoration': 'none', 'color': '#333', 'fontSize': '14px'}),
+        dcc.Link('Vol Analyzer', href='/analyzer', style={'display': 'block', 'padding': '8px', 'textDecoration': 'none', 'color': '#333', 'fontSize': '14px'}),
+        dcc.Link('PCR Skew', href='/pcr', style={'display': 'block', 'padding': '8px', 'textDecoration': 'none', 'color': '#333', 'fontSize': '14px'}),
+        dcc.Link('IV Ratio', href='/iv-ratio', style={'display': 'block', 'padding': '8px', 'textDecoration': 'none', 'color': '#333', 'fontSize': '14px'}),
+        dcc.Link('Max Pain', href='/max-pain', style={'display': 'block', 'padding': '8px', 'textDecoration': 'none', 'color': '#333', 'fontSize': '14px'}),
+        dcc.Link('Calendar IV', href='/calendar', style={'display': 'block', 'padding': '8px', 'textDecoration': 'none', 'color': '#fd7e14', 'fontSize': '14px', 'fontWeight': 'bold'}),
+    ], id='sidebar', style=SIDEBAR_STYLE),
     
     # Content
     html.Div(id="page-content", style=CONTENT_STYLE)
 ])
+
+# --- Clientside callback for sidebar toggle ---
+app.clientside_callback(
+    """
+    function(n_clicks, current_state) {
+        if (!n_clicks) return [current_state, {}, {}];
+        var new_state = current_state === 'open' ? 'closed' : 'open';
+        var sidebar_style, content_style;
+        if (new_state === 'closed') {
+            sidebar_style = {'position':'fixed','top':0,'left':0,'bottom':0,'width':'0','padding':'0','overflow':'hidden','backgroundColor':'#f8f9fa','transition':'all 0.3s','zIndex':1000};
+            content_style = {'marginLeft':'1rem','marginRight':'0.5rem','padding':'1rem 0.5rem','transition':'all 0.3s'};
+        } else {
+            sidebar_style = {'position':'fixed','top':0,'left':0,'bottom':0,'width':'11rem','padding':'1rem 0.5rem','backgroundColor':'#f8f9fa','transition':'all 0.3s','overflowY':'auto','zIndex':1000};
+            content_style = {'marginLeft':'12rem','marginRight':'0.5rem','padding':'1rem 0.5rem','transition':'all 0.3s'};
+        }
+        return [new_state, sidebar_style, content_style];
+    }
+    """,
+    [Output('sidebar-state', 'data'),
+     Output('sidebar', 'style'),
+     Output('page-content', 'style')],
+    [Input('sidebar-toggle', 'n_clicks')],
+    [State('sidebar-state', 'data')]
+)
 
 
 # --- ROUTING CALLBACK ---
@@ -673,6 +889,10 @@ def render_page_content(pathname):
         return layout_pcr_view()
     elif pathname == "/iv-ratio":
         return layout_iv_ratio_view()
+    elif pathname == "/max-pain":
+        return layout_max_pain_view()
+    elif pathname == "/calendar":
+        return layout_calendar_view()
     else:
         return html.Div(
             [
@@ -744,7 +964,7 @@ def update_dashboard(n_clicks, expiry_value, scrip_name, existing_options):
         fig.add_trace(go.Bar(
             x=df['STRIKE'], y=df['CE-OI'],
             name='CE OI',
-            marker=dict(color='rgba(40, 167, 69, 0.2)'), # Green with 0.2 opacity
+            marker=dict(color='rgba(40, 167, 69, 0.45)'), # Green with 0.45 opacity
             yaxis='y2'
         ))
         
@@ -752,7 +972,7 @@ def update_dashboard(n_clicks, expiry_value, scrip_name, existing_options):
         fig.add_trace(go.Bar(
             x=df['STRIKE'], y=df['PE-OI'],
             name='PE OI',
-            marker=dict(color='rgba(220, 53, 69, 0.2)'), # Red with 0.2 opacity
+            marker=dict(color='rgba(220, 53, 69, 0.45)'), # Red with 0.45 opacity
             yaxis='y2'
         ))
 
@@ -832,10 +1052,13 @@ def update_heatmap(n_clicks, stored_fig):
         return go.Figure(), dash.no_update
         
     # Generate Data (uses disk cache with 5-min TTL)
-    df_heat = _get_heatmap_data(limit=100)
+    df_heat = _get_heatmap_data()
     
     if df_heat.empty:
         return go.Figure(), dash.no_update
+    # Use only nearest expiry for IV Skew heatmap
+    if 'Expiry_Rank' in df_heat.columns:
+        df_heat = df_heat[df_heat['Expiry_Rank'] == 1].copy()
         
     # Bin Moneyness - Granularity 0.02
     bin_step = 0.02
@@ -848,32 +1071,34 @@ def update_heatmap(n_clicks, stored_fig):
 
     # Helper to pivot multiple metrics aligned
     def create_pivot(df_sub):
-        # We need to ensure all pivots have same shape. 
         # Pivot each metric
         p_ratio = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='Ratio', aggfunc='mean').sort_index(ascending=False)
         p_oi = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='OI', aggfunc='mean').sort_index(ascending=False)
-        p_spread = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='Spread', aggfunc='mean').sort_index(ascending=False)
+        p_bid = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='Bid', aggfunc='mean').sort_index(ascending=False)
+        p_ask = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='Ask', aggfunc='mean').sort_index(ascending=False)
+        p_strike = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='Strike', aggfunc='mean').sort_index(ascending=False)
+        p_iv = df_sub.pivot_table(index='Symbol', columns='Moneyness_Bin', values='IV', aggfunc='mean').sort_index(ascending=False)
         
-        # Filter columns to 0.8-1.2 (using ratio columns as master)
+        # Filter columns to 0.8-1.2
         cols = [c for c in p_ratio.columns if 0.8 <= c <= 1.2]
         
-        return p_ratio[cols], p_oi[cols], p_spread[cols]
+        return p_ratio[cols], p_oi[cols], p_bid[cols], p_ask[cols], p_strike[cols], p_iv[cols]
 
     # --- CE HEATMAP ---
     df_ce = df_heat[df_heat['Type'] == 'CE']
-    ce_ratio, ce_oi, ce_spread = create_pivot(df_ce)
+    ce_ratio, ce_oi, ce_bid, ce_ask, ce_strike, ce_iv = create_pivot(df_ce)
     
     # Custom Data for CE: Stack along last axis
-    # shape: (rows, cols, 2) -> index 0: OI, index 1: Spread
+    # shape: (rows, cols, 5) -> OI, Bid, Ask, Strike, IV
     import numpy as np
-    ce_custom = np.dstack((ce_oi.values, ce_spread.values))
+    ce_custom = np.dstack((ce_oi.values, ce_bid.values, ce_ask.values, ce_strike.values, ce_iv.values))
     
     # --- PE HEATMAP ---
     df_pe = df_heat[df_heat['Type'] == 'PE']
-    pe_ratio, pe_oi, pe_spread = create_pivot(df_pe)
+    pe_ratio, pe_oi, pe_bid, pe_ask, pe_strike, pe_iv = create_pivot(df_pe)
     
     # Custom Data for PE
-    pe_custom = np.dstack((pe_oi.values, pe_spread.values))
+    pe_custom = np.dstack((pe_oi.values, pe_bid.values, pe_ask.values, pe_strike.values, pe_iv.values))
     
     # Create Subplots: 2 Rows
     fig = make_subplots(
@@ -897,7 +1122,7 @@ def update_heatmap(n_clicks, stored_fig):
         y=ce_ratio.index,
         customdata=ce_custom,
         colorbar_y=0.8,
-        hovertemplate="<b>Symbol: %{y}</b><br>Moneyness: %{x}<br>Ratio: %{z:.2f}<br>OI: %{customdata[0]:,}<br>Spread: %{customdata[1]:.2f}<extra>CE</extra>",
+        hovertemplate="<b>Symbol: %{y}</b><br>Moneyness: %{x}<br>Strike: %{customdata[3]:,.0f}<br>IV: %{customdata[4]:.2f}%<br>Ratio: %{z:.2f}<br>OI: %{customdata[0]:,}<br>Bid: %{customdata[1]:.2f}<br>Ask: %{customdata[2]:.2f}<extra>CE</extra>",
         **hm_args
     ), row=1, col=1)
     
@@ -908,13 +1133,13 @@ def update_heatmap(n_clicks, stored_fig):
         y=pe_ratio.index,
         customdata=pe_custom,
         colorbar_y=0.2,
-        hovertemplate="<b>Symbol: %{y}</b><br>Moneyness: %{x}<br>Ratio: %{z:.2f}<br>OI: %{customdata[0]:,}<br>Spread: %{customdata[1]:.2f}<extra>PE</extra>",
+        hovertemplate="<b>Symbol: %{y}</b><br>Moneyness: %{x}<br>Strike: %{customdata[3]:,.0f}<br>IV: %{customdata[4]:.2f}%<br>Ratio: %{z:.2f}<br>OI: %{customdata[0]:,}<br>Bid: %{customdata[1]:.2f}<br>Ask: %{customdata[2]:.2f}<extra>PE</extra>",
         **hm_args
     ), row=2, col=1)
     
     # Layout
     fig.update_layout(
-        title=f"NFO {title} Heatmap (All {len(ce_ratio)} Symbols)",
+        title=f"Market IV Skew Heatmap (All {len(ce_ratio)} Symbols — NFO + MCX + BFO)",
         height=max(800, len(ce_ratio) * 25), 
         xaxis2={'title': "Moneyness (Strike / Spot)", 'tickmode': 'linear', 'dtick': 0.05}
     )
@@ -977,10 +1202,12 @@ def update_pcr_heatmap(n_clicks, stored_fig):
         return go.Figure(), dash.no_update
     
     # Use disk cache
-    df_heat = _get_heatmap_data(limit=100)
+    df_heat = _get_heatmap_data()
     
     if df_heat.empty:
         return go.Figure(), dash.no_update
+    if 'Expiry_Rank' in df_heat.columns:
+        df_heat = df_heat[df_heat['Expiry_Rank'] == 1].copy()
     
     # Bin Moneyness - same granularity as IV heatmap
     bin_step = 0.02
@@ -1046,10 +1273,12 @@ def update_ivratio_heatmap(n_clicks, stored_fig):
         return go.Figure(), dash.no_update
     
     # Use disk cache
-    df_heat = _get_heatmap_data(limit=100)
+    df_heat = _get_heatmap_data()
     
     if df_heat.empty:
         return go.Figure(), dash.no_update
+    if 'Expiry_Rank' in df_heat.columns:
+        df_heat = df_heat[df_heat['Expiry_Rank'] == 1].copy()
     
     # Bin Moneyness
     bin_step = 0.02
@@ -1100,6 +1329,364 @@ def update_ivratio_heatmap(n_clicks, stored_fig):
     
     return fig, fig
 
+# --- MAX PAIN CALLBACKS ---
+@app.callback(
+    [Output('maxpain-table-container', 'children'),
+     Output('graph-maxpain-heatmap', 'figure'),
+     Output('store-maxpain-data', 'data')],
+    [Input('btn-maxpain', 'n_clicks')],
+    [State('store-maxpain-data', 'data')]
+)
+def update_maxpain(n_clicks, stored_data):
+    if not n_clicks:
+        if stored_data:
+            # Restore from session store
+            summary = pd.DataFrame(stored_data['summary'])
+            pain_profiles = {k: pd.DataFrame(v) for k, v in stored_data['profiles'].items()}
+        else:
+            return html.Div(), go.Figure(), dash.no_update
+    else:
+        # Get data from disk cache
+        df_heat = _get_heatmap_data()
+        if df_heat.empty:
+            return html.Div("No data available."), go.Figure(), dash.no_update
+        if 'Expiry_Rank' in df_heat.columns:
+            df_heat = df_heat[df_heat['Expiry_Rank'] == 1].copy()
+        
+        summary, pain_profiles = compute_max_pain(df_heat)
+    
+    if summary.empty:
+        return html.Div("No Max Pain data computed."), go.Figure(), dash.no_update
+    
+    # --- Section 1: Summary DataTable ---
+    table_df = summary[['Symbol', 'Spot', 'Max Pain', 'Distance%', 'Bias']].copy()
+    
+    table = dash_table.DataTable(
+        id='maxpain-table',
+        columns=[{'name': c, 'id': c} for c in table_df.columns],
+        data=table_df.to_dict('records'),
+        sort_action='native',
+        filter_action='native',
+        page_size=20,
+        row_selectable='single',
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'center', 'padding': '8px', 'fontSize': '14px'},
+        style_header={'backgroundColor': '#007bff', 'color': 'white', 'fontWeight': 'bold'},
+        style_data_conditional=[
+            {'if': {'filter_query': '{Bias} contains "Bull"'}, 'backgroundColor': '#d4edda', 'color': '#155724'},
+            {'if': {'filter_query': '{Bias} contains "Bear"'}, 'backgroundColor': '#f8d7da', 'color': '#721c24'},
+        ]
+    )
+    
+    # --- Section 2: Top 5 Pain Heatmap ---
+    # Build matrix: rows = symbols, cols = rank (1st-5th highest pain strike)
+    symbols = summary['Symbol'].tolist()
+    
+    # Z values (total pain), custom data, and x-labels
+    z_matrix = []
+    custom_matrix = []
+    x_labels = ['#1 Highest', '#2', '#3', '#4', '#5']
+    
+    for _, row in summary.iterrows():
+        sym = row['Symbol']
+        top5_strikes = row['Top5_Strikes']
+        top5_pain = row['Top5_Pain']
+        profile = pain_profiles.get(sym, pd.DataFrame())
+        
+        z_row = []
+        custom_row = []
+        for j in range(5):
+            if j < len(top5_strikes):
+                strike = top5_strikes[j]
+                pain = top5_pain[j]
+                # Get CE/PE breakdown from profile
+                prow = profile[profile['Strike'] == strike]
+                ce_pain = float(prow['CE_Pain'].iloc[0]) if not prow.empty else 0
+                pe_pain = float(prow['PE_Pain'].iloc[0]) if not prow.empty else 0
+                ce_oi = float(prow['CE_OI'].iloc[0]) if not prow.empty else 0
+                pe_oi = float(prow['PE_OI'].iloc[0]) if not prow.empty else 0
+                z_row.append(pain)
+                custom_row.append([strike, pain, ce_pain, pe_pain, ce_oi, pe_oi])
+            else:
+                z_row.append(0)
+                custom_row.append([0, 0, 0, 0, 0, 0])
+        z_matrix.append(z_row)
+        custom_matrix.append(custom_row)
+    
+    # Normalize per row (0-1) so each symbol uses full color range
+    z_normalized = []
+    for z_row in z_matrix:
+        row_max = max(z_row) if max(z_row) > 0 else 1
+        z_normalized.append([v / row_max for v in z_row])
+    
+    fig_heatmap = go.Figure(go.Heatmap(
+        z=z_normalized,
+        x=x_labels,
+        y=symbols,
+        customdata=custom_matrix,
+        colorscale='YlOrRd',
+        zmin=0, zmax=1,
+        colorbar=dict(title='Pain (normalized)', tickvals=[0, 0.5, 1], ticktext=['Low', 'Mid', 'High']),
+        hovertemplate="<b>%{y}</b><br>Rank: %{x}<br>Strike: %{customdata[0]}<br>Total Pain: %{customdata[1]:,.0f}<br>CE Pain: %{customdata[2]:,.0f}<br>PE Pain: %{customdata[3]:,.0f}<br>CE OI: %{customdata[4]:,}<br>PE OI: %{customdata[5]:,}<extra></extra>"
+    ))
+    
+    fig_heatmap.update_layout(
+        title=f"Top 5 Highest-Pain Strikes ({len(symbols)} Symbols) — Color normalized per symbol",
+        height=max(800, len(symbols) * 25),
+        yaxis={'dtick': 1}
+    )
+    
+    # Prepare store data (serialize profiles for session storage)
+    store_data = {
+        'summary': summary.to_dict('records'),
+        'profiles': {k: v.to_dict('records') for k, v in pain_profiles.items()}
+    }
+    
+    return table, fig_heatmap, store_data
+
+
+@app.callback(
+    [Output('graph-maxpain-drilldown', 'figure'),
+     Output('drilldown-title', 'children')],
+    [Input('maxpain-table', 'selected_rows')],
+    [State('maxpain-table', 'data'),
+     State('store-maxpain-data', 'data')]
+)
+def update_maxpain_drilldown(selected_rows, table_data, stored_data):
+    if not selected_rows or not table_data or not stored_data:
+        return go.Figure(), "Click a row in the table to see the full pain profile"
+    
+    row = table_data[selected_rows[0]]
+    sym = row['Symbol']
+    spot = row['Spot']
+    max_pain = row['Max Pain']
+    
+    # Get pain profile from stored data
+    profiles = stored_data.get('profiles', {})
+    if sym not in profiles:
+        return go.Figure(), f"No profile data for {sym}"
+    
+    profile = pd.DataFrame(profiles[sym])
+    
+    # Stacked bar chart: CE Pain + PE Pain at each strike
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=profile['Strike'], y=profile['CE_Pain'],
+        name='CE Pain (Resistance)',
+        marker_color='#dc3545',
+        hovertemplate="Strike: %{x}<br>CE Pain: %{y:,.0f}<extra>CE</extra>"
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=profile['Strike'], y=profile['PE_Pain'],
+        name='PE Pain (Support)',
+        marker_color='#28a745',
+        hovertemplate="Strike: %{x}<br>PE Pain: %{y:,.0f}<extra>PE</extra>"
+    ))
+    
+    # Mark Max Pain strike
+    fig.add_vline(
+        x=max_pain, line_width=3, line_dash="dash", line_color="blue",
+        annotation_text=f"Max Pain: {max_pain}", annotation_position="top right"
+    )
+    
+    # Mark Spot price
+    fig.add_vline(
+        x=spot, line_width=2, line_dash="dot", line_color="black",
+        annotation_text=f"Spot: {spot}", annotation_position="top left"
+    )
+    
+    fig.update_layout(
+        barmode='stack',
+        title=f"Pain Profile: {sym}  |  Spot: {spot}  |  Max Pain: {max_pain}  |  Distance: {row['Distance%']}%",
+        xaxis_title="Strike Price",
+        yaxis_title="Total Pain (₹ × OI)",
+        height=500,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+    )
+    
+    return fig, f"Pain Profile for {sym}"
+
+# --- CALENDAR SPREAD CALLBACKS ---
+@app.callback(
+    [Output('graph-calendar-atm', 'figure'),
+     Output('calendar-table-container', 'children'),
+     Output('store-calendar-data', 'data')],
+    [Input('btn-calendar', 'n_clicks')],
+    [State('store-calendar-data', 'data')]
+)
+def update_calendar_spread(n_clicks, stored_data):
+    if not n_clicks:
+        if stored_data:
+            # Restore if available (though complex to restore table fully without regenerating)
+            # For simplicity, just return empty on load or re-generate if needed.
+            # But stored_data is dict of records.
+            return go.Figure(), html.Div(), dash.no_update
+        return go.Figure(), html.Div(), dash.no_update
+    
+    # 1. Get Data (Full dataset with all ranks)
+    df_heat = _get_heatmap_data()
+    
+    if df_heat.empty:
+        return go.Figure(), html.Div("No data available."), dash.no_update
+    
+    # Ensure necessary columns
+    needed_cols = ['Symbol', 'Expiry_Rank', 'ATM_IV', 'Expiry']
+    if not all(c in df_heat.columns for c in needed_cols):
+        return go.Figure(), html.Div("Data missing required columns (Expiry_Rank, ATM_IV). Try clearing cache."), dash.no_update
+        
+    # 2. Process Data: Find symbols with BOTH Rank 1 and Rank 2
+    # Group by Symbol and Expiry_Rank to get ATM_IV (should be same for all rows of that rank)
+    df_atm = df_heat.groupby(['Symbol', 'Expiry_Rank']).agg({
+        'ATM_IV': 'first',
+        'Expiry': 'first',
+        'Spot': 'first'
+    }).reset_index()
+    
+    # Pivot to get Rank 1 and Rank 2 side-by-side
+    df_pivot = df_atm.pivot(index='Symbol', columns='Expiry_Rank', values=['ATM_IV', 'Expiry', 'Spot'])
+    
+    # Flatten columns
+    df_pivot.columns = [f'{c[0]}_{c[1]}' for c in df_pivot.columns]
+    
+    # Filter for symbols that have both Rank 1 and Rank 2
+    if 'ATM_IV_1' not in df_pivot.columns or 'ATM_IV_2' not in df_pivot.columns:
+         return go.Figure(), html.Div("Insufficient multi-expiry data found."), dash.no_update
+         
+    df_spread = df_pivot.dropna(subset=['ATM_IV_1', 'ATM_IV_2']).copy()
+    
+    if df_spread.empty:
+        return go.Figure(), html.Div("No symbols found with both Near and Far expiry data."), dash.no_update
+        
+    # Calculate Spread: Near IV - Far IV
+    # Positive = Near is higher (IV Inversion / Backwardation? / Event) -> Red
+    # Negative = Far is higher (Normal / Contango) -> Green
+    df_spread['Spread'] = df_spread['ATM_IV_1'] - df_spread['ATM_IV_2']
+    df_spread['Abs_Spread'] = df_spread['Spread'].abs()
+    
+    # Sort by magnitude of spread
+    df_spread = df_spread.sort_values('Abs_Spread', ascending=False).reset_index()
+    
+    # Prepare Table
+    table_df = df_spread[['Symbol', 'ATM_IV_1', 'ATM_IV_2', 'Spread', 'Expiry_1', 'Expiry_2']].copy()
+    table_df.columns = ['Symbol', 'Near IV%', 'Far IV%', 'Spread', 'Near Exp', 'Far Exp']
+    table_df['Near IV%'] = table_df['Near IV%'].round(2)
+    table_df['Far IV%'] = table_df['Far IV%'].round(2)
+    table_df['Spread'] = table_df['Spread'].round(2)
+    
+    table = dash_table.DataTable(
+        id='calendar-table',
+        columns=[{'name': c, 'id': c} for c in table_df.columns],
+        data=table_df.to_dict('records'),
+        sort_action='native',
+        filter_action='native',
+        page_size=15,
+        row_selectable='single',
+        style_table={'overflowX': 'auto'},
+        style_cell={'textAlign': 'center', 'padding': '8px'},
+        style_header={'backgroundColor': '#fd7e14', 'color': 'white', 'fontWeight': 'bold'},
+        style_data_conditional=[
+            {'if': {'filter_query': '{Spread} > 0', 'column_id': 'Spread'}, 'color': '#dc3545', 'fontWeight': 'bold'}, # Red for Inversion
+            {'if': {'filter_query': '{Spread} < 0', 'column_id': 'Spread'}, 'color': '#28a745', 'fontWeight': 'bold'}, # Green for Normal
+        ]
+    )
+    
+    # Prepare Bar Chart (Top 30 by spread magnitude)
+    top_n = df_spread.head(30)
+    colors = ['#dc3545' if s > 0 else '#28a745' for s in top_n['Spread']] # Red if > 0, Green if < 0
+    
+    fig = go.Figure(go.Bar(
+        x=top_n['Spread'],
+        y=top_n['Symbol'],
+        orientation='h',
+        marker_color=colors,
+        text=top_n['Spread'].round(2),
+        textposition='auto',
+        hovertemplate="<b>%{y}</b><br>Spread: %{x:.2f}%<br>Near IV: %{customdata[0]:.2f}%<br>Far IV: %{customdata[1]:.2f}%<extra></extra>",
+        customdata=top_n[['ATM_IV_1', 'ATM_IV_2']]
+    ))
+    
+    fig.update_layout(
+        title=f"Calendar Spread (Near IV - Far IV) — Top {len(top_n)} Divergences",
+        xaxis_title="Spread (IV%)",
+        yaxis={'autorange': 'reversed'},
+        height=max(600, len(top_n) * 20),
+        template="plotly_white"
+    )
+    
+    fig.add_vline(x=0, line_width=1, line_color="black")
+    
+    # Store full data for drilldown (convert to dict of records)
+    # We only need rows for symbols in our spread list to save space
+    relevant_symbols = df_spread['Symbol'].tolist()
+    df_store = df_heat[df_heat['Symbol'].isin(relevant_symbols)].copy()
+    
+    # Store as simple list of records
+    store_data = df_store.to_dict('records')
+    
+    return fig, table, store_data
+
+
+@app.callback(
+    [Output('graph-calendar-drilldown', 'figure'),
+     Output('calendar-drilldown-title', 'children')],
+    [Input('calendar-table', 'selected_rows')],
+    [State('calendar-table', 'data'),
+     State('store-calendar-data', 'data')]
+)
+def update_calendar_drilldown(selected_rows, table_data, stored_data):
+    if not selected_rows or not table_data or not stored_data:
+        return go.Figure(), "Click a row in the table to see strike-level details"
+    
+    row = table_data[selected_rows[0]]
+    sym = row['Symbol']
+    
+    # Filter stored data
+    df = pd.DataFrame(stored_data)
+    df_sym = df[df['Symbol'] == sym].copy()
+    
+    if df_sym.empty:
+        return go.Figure(), f"No data found for {sym}"
+    
+    # Separate rankings
+    df1 = df_sym[df_sym['Expiry_Rank'] == 1].sort_values('Strike')
+    df2 = df_sym[df_sym['Expiry_Rank'] == 2].sort_values('Strike')
+    
+    # Identify expiries
+    exp1 = df1['Expiry'].iloc[0] if not df1.empty else "Near"
+    exp2 = df2['Expiry'].iloc[0] if not df2.empty else "Far"
+    
+    # Figure: Grouped Bar
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=df1['Strike'], y=df1['IV'],
+        name=f"Near: {exp1}",
+        marker_color='#007bff'
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=df2['Strike'], y=df2['IV'],
+        name=f"Far: {exp2}",
+        marker_color='#fd7e14' # Orange
+    ))
+    
+    # Calculate difference at each common strike
+    common_strikes = set(df1['Strike']).intersection(set(df2['Strike']))
+    # Could add a line for difference? Maybe too messy.
+    # Let's keep it simple side-by-side bars.
+    
+    fig.update_layout(
+        title=f"Calendar IV Structure: {sym} ({exp1} vs {exp2})",
+        xaxis_title="Strike Price",
+        yaxis_title="Implied Volatility (%)",
+        barmode='group',
+        hovermode="x unified",
+        template="plotly_white"
+    )
+    
+    return fig, f"Strike-wise IV Comparison: {sym}"
 # ==============================================================================
 # 5. SERVER RUN
 # ==============================================================================
