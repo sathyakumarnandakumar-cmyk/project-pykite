@@ -21,7 +21,10 @@ logging.basicConfig(level=logging.DEBUG)
 # Initialize Kite
 kite = KiteConnect(api_key=API_KEY)
 
-print(f"API_KEY: {API_KEY}")
+if API_KEY:
+    print(f"API_KEY: {API_KEY[:5]}...")
+else:
+    print("API_KEY: None")
 print(f"Login URL: {LOGIN_URL}")
 
 
