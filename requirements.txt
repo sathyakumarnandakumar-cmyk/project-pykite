@@ -1,1 +1,8 @@
-streamlit
+fastapi
+uvicorn
+pandas
+numpy
+kiteconnect
+python-dotenv
+requests
+pydantic
