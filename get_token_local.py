@@ -74,10 +74,16 @@ class TokenHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(b"<h1>Error: No request_token found in URL.</h1>")
 
 
-if __name__ == "__main__":
+
+def login():
+    """
+    Triggers the local login flow.
+    """
+    global server_keep_running
+    
     # Validate credentials
     if not validate_credentials():
-        exit(1)
+        return
     
     # Open the login page automatically in default browser
     print(f"Opening login page: {LOGIN_URL}")
@@ -88,7 +94,12 @@ if __name__ == "__main__":
     
     server_keep_running = True
     with socketserver.TCPServer(("", PORT), TokenHandler) as httpd:
+        # Set a timeout so the loop yields control periodically, allowing interrupts
+        httpd.timeout = 1.0
         while server_keep_running:
             httpd.handle_request()
 
     print("\n✓ Server stopped. You can now run your main trading bot.")
+
+if __name__ == "__main__":
+    login()
